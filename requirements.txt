@@ -1,6 +1,13 @@
+# Web layer
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-sarvamai
-audioop-lts
 python-multipart==0.0.9
-python-dotenv==1.0.1
+python-dotenv==1.2.3
+
+# Sarvam: STT, chat and TTS
+sarvamai==0.1.34
+httpx==0.28.1
+websockets==17.1
+
+# `audioop` left the standard library in Python 3.13; this puts it back.
+audioop-lts==0.2.2 ; python_version >= "3.13"
