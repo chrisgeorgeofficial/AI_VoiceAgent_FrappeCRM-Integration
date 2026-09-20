@@ -253,13 +253,16 @@ class CallSession:
 
     # --- the turn loop -------------------------------------------------------
 
-    async def _on_transcript(self, transcript: str) -> None:
+    async def _on_transcript(self, transcript: str, language: str = "") -> None:
+        if language and self.record is not None:
+            self.record.languages.add(language)
+
         if not AGENT_REPLY_ENABLED:
             # Step 18's checkpoint: prove transcription works on its own before
             # anything tries to answer.
             log("agent: replies disabled, transcript only")
             return
-        self._work.put_nowait((TURN, transcript))
+        self._work.put_nowait((TURN, (transcript, language)))
 
     async def _run_worker(self) -> None:
         """Process one piece of work at a time, forever, without dying."""
@@ -273,7 +276,7 @@ class CallSession:
                     if await self._speak(payload):
                         self._remember("assistant", payload)
                 else:
-                    await self._answer(payload)
+                    await self._answer(*payload)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - one bad turn is not a dead call
@@ -282,22 +285,24 @@ class CallSession:
             finally:
                 self._work.task_done()
 
-    async def _answer(self, transcript: str) -> None:
+    async def _answer(self, transcript: str, language: str = "") -> None:
         self.history.append({"role": "user", "content": transcript})
         self._remember("user", transcript)
-        reply = await get_ai_reply(self._client, self.history)
+        # The language travels with the turn: the model is told which one to
+        # answer in, and the voice speaks that same one back.
+        reply = await get_ai_reply(self._client, self.history, language)
         if not reply:
             log("agent: empty reply, saying nothing")
             return
 
-        finished = await self._speak(reply)
+        finished = await self._speak(reply, language)
         # A reply the caller cut off was only half heard. Recording that stops
         # the model assuming it landed and referring back to it next turn.
         spoken = reply if finished else f"{reply} [interrupted by caller]"
         self.history.append({"role": "assistant", "content": spoken})
         self._remember("assistant", spoken)
 
-    async def _speak(self, text: str) -> bool:
+    async def _speak(self, text: str, language: str = "") -> bool:
         """Play `text` into the call. False means the caller cut in."""
         if not self.stream_sid:
             log("!! no streamSid yet - cannot send audio")
@@ -319,7 +324,7 @@ class CallSession:
             self.websocket, self.stream_sid, should_stop=self._interrupt.is_set
         )
 
-        async with contextlib.aclosing(self._audio_for(text)) as audio:
+        async with contextlib.aclosing(self._audio_for(text, language)) as audio:
             async for chunk in audio:
                 if self._interrupt.is_set():
                     break
@@ -360,16 +365,16 @@ class CallSession:
         )
         return not interrupted
 
-    async def _audio_for(self, text: str):
+    async def _audio_for(self, text: str, language: str = ""):
         """Mu-law for `text`: streamed as it renders, or one buffered lump."""
         if TTS_STREAMING:
             async with contextlib.aclosing(
-                stream_speech(self._client, text)
+                stream_speech(self._client, text, language)
             ) as stream:
                 async for chunk in stream:
                     yield chunk
         else:
-            yield await text_to_speech(self._client, text)
+            yield await text_to_speech(self._client, text, language)
 
     # --- teardown ------------------------------------------------------------
 

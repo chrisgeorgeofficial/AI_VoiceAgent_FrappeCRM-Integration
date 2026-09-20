@@ -31,13 +31,31 @@ from app.logging_utils import log
 # stream has stalled rather than that it is merely thinking.
 STREAM_TIMEOUT = 20.0
 
+# What bulbul can actually speak. A language Sarvam detected but the voice
+# cannot render - or no detection at all - falls back to the configured one
+# rather than failing the reply.
+SPEAKABLE = {
+    "bn-IN", "en-IN", "gu-IN", "hi-IN", "kn-IN", "ml-IN",
+    "mr-IN", "od-IN", "pa-IN", "ta-IN", "te-IN",
+}
 
-async def text_to_speech(client: AsyncSarvamAI, text: str) -> bytes:
+
+def speakable(language: str) -> str:
+    if language in SPEAKABLE:
+        return language
+    if language:
+        log(f"tts: cannot speak {language}, using {SARVAM_LANGUAGE}")
+    return SARVAM_LANGUAGE
+
+
+async def text_to_speech(
+    client: AsyncSarvamAI, text: str, language: str = ""
+) -> bytes:
     """Synthesise `text` and return it as 8 kHz mu-law, ready for Twilio."""
     response = await client.text_to_speech.convert(
         text=text,
         model=SARVAM_TTS_MODEL,
-        language_code=SARVAM_LANGUAGE,
+        language_code=speakable(language),
         speaker=SARVAM_TTS_SPEAKER,
         speech_sample_rate=TELEPHONY_SAMPLE_RATE,
     )
@@ -52,7 +70,7 @@ async def text_to_speech(client: AsyncSarvamAI, text: str) -> bytes:
 
 
 async def stream_speech(
-    client: AsyncSarvamAI, text: str
+    client: AsyncSarvamAI, text: str, language: str = ""
 ) -> AsyncIterator[bytes]:
     """Synthesise `text`, yielding 8 kHz mu-law as each piece is rendered.
 
@@ -71,7 +89,7 @@ async def stream_speech(
         send_completion_event="true",
     ) as socket:
         await socket.configure(
-            target_language_code=SARVAM_LANGUAGE,
+            target_language_code=speakable(language),
             speaker=SARVAM_TTS_SPEAKER,
             speech_sample_rate=TELEPHONY_SAMPLE_RATE,
             # Twilio's own wire format, so these bytes need no conversion at all.

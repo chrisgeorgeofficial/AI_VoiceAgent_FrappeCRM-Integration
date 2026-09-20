@@ -226,3 +226,16 @@ CORS_ORIGINS = [
 # "Task" doctype - CRM Task is the one the lead view shows.
 FOLLOW_UP_TASKS = _flag("FOLLOW_UP_TASKS", default=True)
 FOLLOW_UP_TASK_STATUS = os.getenv("FOLLOW_UP_TASK_STATUS", "Todo").strip()
+
+
+# --- Language ----------------------------------------------------------------
+
+# Let Sarvam work out what the caller is speaking instead of being told. The
+# transcript then carries the detected language, and the reply is spoken back
+# in it. SARVAM_LANGUAGE stays the fallback: the greeting, and any turn whose
+# language could not be established.
+SARVAM_AUTO_LANGUAGE = _flag("SARVAM_AUTO_LANGUAGE", default=True)
+
+# Ignore a detected language the model is unsure about, rather than answering
+# in the wrong one. Measured confidence on clean speech is around 0.96-0.98.
+LANGUAGE_MIN_CONFIDENCE = float(os.getenv("LANGUAGE_MIN_CONFIDENCE", "0.6"))

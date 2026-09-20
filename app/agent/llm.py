@@ -7,7 +7,7 @@ file changes and the audio pipeline either side of it does not notice.
 
 from sarvamai import AsyncSarvamAI
 
-from app.config import HISTORY_TURNS, SARVAM_CHAT_MODEL, SARVAM_LANGUAGE
+from app.config import HISTORY_TURNS, SARVAM_CHAT_MODEL
 from app.logging_utils import log
 
 # Sarvam's language codes carry a region; the prompt reads better with a name.
@@ -31,9 +31,23 @@ SYSTEM_PROMPT = (
     "You are a sales enquiry assistant for a demo business, speaking to a "
     "caller on the phone. Find out what they are interested in, and note their "
     "budget, their timeline, and any objection they raise. Ask one question at "
-    "a time. Respond only in {language}. Keep every reply to one or two short "
-    "sentences, and write them the way they will be read aloud - no bullet "
-    "points, no markdown, no emoji."
+    "a time. {language_rule} Keep every reply to one or two short sentences, "
+    "and write them the way they will be read aloud - no bullet points, no "
+    "markdown, no emoji."
+)
+
+# Callers switch between languages mid-sentence, and Indian English is full of
+# borrowed words either way. Naming the language the caller just used beats
+# "reply in the same language", which leaves the model guessing from a
+# transcript it may have only half understood.
+LANGUAGE_RULE = (
+    "The caller is speaking {language}, so reply in {language}. If they mix in "
+    "English words, that is normal - mirror how they speak rather than "
+    "correcting them."
+)
+DEFAULT_LANGUAGE_RULE = (
+    "Reply in the same language the caller is using, mirroring how they speak "
+    "if they mix languages."
 )
 
 # Anything longer than this is the model ignoring the instruction above; cut it
@@ -41,18 +55,25 @@ SYSTEM_PROMPT = (
 MAX_REPLY_TOKENS = 120
 
 
-def system_message(language_code: str = SARVAM_LANGUAGE) -> dict:
-    language = _LANGUAGE_NAMES.get(language_code, "English")
-    return {"role": "system", "content": SYSTEM_PROMPT.format(language=language)}
+def system_message(language_code: str = "") -> dict:
+    """The agent's brief, told which language this turn is in if we know."""
+    language = _LANGUAGE_NAMES.get(language_code)
+    rule = (
+        LANGUAGE_RULE.format(language=language) if language
+        else DEFAULT_LANGUAGE_RULE
+    )
+    return {"role": "system", "content": SYSTEM_PROMPT.format(language_rule=rule)}
 
 
-async def get_ai_reply(client: AsyncSarvamAI, history: list[dict]) -> str:
+async def get_ai_reply(
+    client: AsyncSarvamAI, history: list[dict], language: str = ""
+) -> str:
     """Answer the latest turn, given the conversation so far.
 
     `history` is the alternating user/assistant messages - the system prompt is
     added here so callers never have to remember it.
     """
-    messages = [system_message(), *history[-HISTORY_TURNS:]]
+    messages = [system_message(language), *history[-HISTORY_TURNS:]]
 
     response = await client.chat.completions(
         messages=messages,

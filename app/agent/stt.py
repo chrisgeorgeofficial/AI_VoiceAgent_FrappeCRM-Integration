@@ -25,6 +25,8 @@ from app.audio.codec import (
     wrap_as_wav,
 )
 from app.config import (
+    LANGUAGE_MIN_CONFIDENCE,
+    SARVAM_AUTO_LANGUAGE,
     SARVAM_LANGUAGE,
     SARVAM_STT_MODE,
     SARVAM_STT_MODEL,
@@ -35,7 +37,8 @@ from app.logging_utils import log
 # How many bytes of PCM16 make up one chunk's worth of audio.
 CHUNK_BYTES = TELEPHONY_SAMPLE_RATE * SAMPLE_WIDTH * STT_CHUNK_MS // 1000
 
-TranscriptHandler = Callable[[str], Awaitable[None]]
+# Called with the words and the language they were spoken in ('' if unknown).
+TranscriptHandler = Callable[[str, str], Awaitable[None]]
 
 
 class Transcriber:
@@ -55,14 +58,18 @@ class Transcriber:
 
     async def start(self) -> "Transcriber":
         """Open the socket and begin reading results."""
+        # "unknown" asks Sarvam to detect the language. It then reports which
+        # one it heard on every transcript, which is what lets the agent answer
+        # in the caller's language rather than a language chosen in advance.
+        requested = "unknown" if SARVAM_AUTO_LANGUAGE else SARVAM_LANGUAGE
         log(
             f"stt: connecting (model={SARVAM_STT_MODEL} mode={SARVAM_STT_MODE} "
-            f"language={SARVAM_LANGUAGE} rate={TELEPHONY_SAMPLE_RATE} "
+            f"language={requested} rate={TELEPHONY_SAMPLE_RATE} "
             f"chunk={STT_CHUNK_MS}ms)"
         )
         self._socket = await self._stack.enter_async_context(
             self._client.speech_to_text_streaming.connect(
-                language_code=SARVAM_LANGUAGE,
+                language_code=requested,
                 model=SARVAM_STT_MODEL,
                 mode=SARVAM_STT_MODE,
                 # The SDK types this query parameter as a string.
@@ -149,5 +156,21 @@ class Transcriber:
         if not transcript:
             return
 
-        log(f"stt: transcript: {transcript!r}")
-        await self._on_transcript(transcript)
+        language = self._detected_language(data)
+        log(f"stt: transcript [{language or 'unknown'}]: {transcript!r}")
+        await self._on_transcript(transcript, language)
+
+    @staticmethod
+    def _detected_language(data) -> str:
+        """Which language Sarvam thinks that was, if it is confident enough.
+
+        A low-confidence guess is worse than none: answering in the wrong
+        language is more jarring to a caller than sticking to the default.
+        """
+        code = getattr(data, "language_code", None) or ""
+        confidence = getattr(data, "language_probability", None)
+
+        if code and confidence is not None and confidence < LANGUAGE_MIN_CONFIDENCE:
+            log(f"stt: language {code} only {confidence:.2f} confident, ignoring")
+            return ""
+        return code

@@ -33,6 +33,9 @@ class CallRecord:
         default_factory=lambda: datetime.now(timezone.utc)
     )
     turns: list[dict] = field(default_factory=list)
+    # Every language the caller was detected speaking; more than one means
+    # the call was conducted in a mix.
+    languages: set[str] = field(default_factory=set)
     recorder: CallRecorder = field(default_factory=CallRecorder)
 
     def add(self, role: str, content: str) -> None:

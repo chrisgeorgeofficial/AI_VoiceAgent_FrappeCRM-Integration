@@ -36,7 +36,9 @@ TERMINAL = set(CALL_STATUS)
 # Extracted for our own use, not columns on the DocType.
 INTERNAL_FIELDS = {"caller_name", "follow_up_when", "follow_up_time_of_day"}
 
-# The DocType's language Select, keyed by Sarvam's BCP-47 code.
+# The DocType's language Select, keyed by Sarvam's BCP-47 code. Anything else
+# Sarvam might detect is recorded as Mixed rather than guessed at, because the
+# Select has no option for it and Frappe rejects a value it does not know.
 LANGUAGES = {"en-IN": "English", "ml-IN": "Malayalam"}
 
 
@@ -154,7 +156,7 @@ def _build_payload(form: dict, record, status: str, fields: dict) -> dict:
     payload = {
         "provider_call_id": form.get("CallSid", ""),
         "direction": _direction(form, record),
-        "language": LANGUAGES.get(SARVAM_LANGUAGE, "Mixed"),
+        "language": _language(record),
         "call_status": CALL_STATUS.get(status, "other"),
         "call_duration": _duration(form),
         # transcript_reference and recording_reference are Attach fields, filled
@@ -168,6 +170,28 @@ def _build_payload(form: dict, record, status: str, fields: dict) -> dict:
     if payload.get("follow_up_at") is None:
         payload.pop("follow_up_at", None)
     return payload
+
+
+def _language(record) -> str:
+    """Which language the call was actually conducted in.
+
+    A caller who switched, or whose speech Sarvam read as two different
+    languages across the call, is recorded as Mixed - which is what that option
+    on the DocType is for.
+    """
+    heard = getattr(record, "languages", set()) if record else set()
+    if not heard:
+        # Nothing detected: either no conversation, or auto-detection is off
+        # and every turn was the configured language anyway.
+        return LANGUAGES.get(SARVAM_LANGUAGE, "Mixed")
+
+    named = {LANGUAGES.get(code) for code in heard}
+    if len(named) == 1:
+        only = named.pop()
+        if only:
+            return only
+    log(f"crm: call was in {sorted(heard)}, recording it as Mixed")
+    return "Mixed"
 
 
 def _direction(form: dict, record) -> str:
