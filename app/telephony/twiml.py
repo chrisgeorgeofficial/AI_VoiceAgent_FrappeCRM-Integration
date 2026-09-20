@@ -2,7 +2,7 @@
 
 from fastapi import Request
 
-from app.config import PUBLIC_HOST
+from app.config import ECHO_TEST, PUBLIC_HOST
 from app.logging_utils import log
 
 SAY_RESPONSE = """<?xml version="1.0" encoding="UTF-8"?>
@@ -51,8 +51,18 @@ def build_stream_response(host: str) -> str:
     """TwiML that hands the call audio to our WebSocket endpoint."""
     stream_url = f"wss://{host}/voice/media"
     log(f"stream url: {stream_url}")
+
+    # In echo mode a spoken line goes first. Hearing it proves Twilio plays
+    # audio on this call at all; hearing the echo afterwards proves it plays
+    # audio we send over the stream. Two different failures, one phone call.
+    preamble = (
+        "<Say>Echo test. Say something and you should hear yourself.</Say>"
+        if ECHO_TEST
+        else ""
+    )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+    {preamble}
     <Connect>
         <Stream url="{stream_url}"/>
     </Connect>

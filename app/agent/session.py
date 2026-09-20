@@ -18,6 +18,7 @@ from collections import deque
 
 from fastapi import WebSocket
 
+from app.agent import transcripts
 from app.agent.client import MissingApiKey, get_client
 from app.agent.llm import get_ai_reply
 from app.agent.stt import Transcriber
@@ -25,6 +26,8 @@ from app.agent.tts import stream_speech, text_to_speech
 from app.audio.codec import TELEPHONY_SAMPLE_RATE, rms, ulaw_to_pcm16
 from app.config import (
     AGENT_REPLY_ENABLED,
+    ECHO_TEST,
+    RECORDING_ENABLED,
     BARGE_IN,
     BARGE_IN_FRAMES,
     BARGE_IN_RMS,
@@ -53,7 +56,11 @@ class CallSession:
     def __init__(self, websocket: WebSocket):
         self.websocket = websocket
         self.stream_sid = ""
+        self.call_sid = ""
         self.history: list[dict] = []
+        # Outlives this object: the status callback arrives after the socket
+        # has closed and can only find the conversation by CallSid.
+        self.record: transcripts.CallRecord | None = None
 
         self._client = None
         self._transcriber: Transcriber | None = None
@@ -98,8 +105,16 @@ class CallSession:
     async def _on_start(self, frame: dict) -> None:
         start = frame.get("start", {})
         self.stream_sid = frame.get("streamSid") or start.get("streamSid", "")
-        log(f"twilio: start streamSid={self.stream_sid} call={start.get('callSid')}")
+        self.call_sid = start.get("callSid", "")
+        log(f"twilio: start streamSid={self.stream_sid} call={self.call_sid}")
         log(f"twilio: media format {start.get('mediaFormat')}")
+
+        if self.call_sid:
+            self.record = transcripts.start(self.call_sid)
+
+        if ECHO_TEST:
+            log("ECHO TEST: bouncing your audio back, nothing else is running")
+            return
 
         try:
             self._client = get_client()
@@ -111,6 +126,12 @@ class CallSession:
 
         self._worker = asyncio.create_task(self._run_worker())
 
+        # Queue the greeting before opening the STT socket, not after. The two
+        # are independent, and waiting for Sarvam to connect first left the
+        # caller listening to about a second of nothing.
+        if GREETING_TEXT:
+            self._work.put_nowait((SAY, GREETING_TEXT))
+
         transcriber = Transcriber(self._client, self._on_transcript)
         try:
             await transcriber.start()
@@ -119,11 +140,24 @@ class CallSession:
         else:
             self._transcriber = transcriber
 
-        if GREETING_TEXT:
-            self._work.put_nowait((SAY, GREETING_TEXT))
-
     async def _on_media(self, frame: dict) -> None:
         self._media_frames += 1
+
+        if ECHO_TEST:
+            payload = frame.get("media", {}).get("payload")
+            if payload and self.stream_sid:
+                # Straight back out, byte for byte, in Twilio's own framing.
+                await self.websocket.send_json(
+                    {
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {"payload": payload},
+                    }
+                )
+            if self._media_frames % LOG_MEDIA_EVERY == 0:
+                log(f"ECHO TEST: bounced {self._media_frames} frames")
+            return
+
         if self._media_frames % LOG_MEDIA_EVERY == 0:
             log(
                 f"twilio: {self._media_frames} media frames in "
@@ -137,6 +171,7 @@ class CallSession:
         if not payload:
             return
         ulaw = base64.b64decode(payload)
+        self._record("caller", ulaw)
 
         # The caller's line carries our own voice back while we are talking.
         # Feeding that to STT makes the agent answer itself.
@@ -154,6 +189,11 @@ class CallSession:
                 return
 
         await self._transcriber.feed(ulaw)
+
+    def _record(self, track: str, ulaw: bytes) -> None:
+        """Keep the audio for the recording attached to the CRM record."""
+        if RECORDING_ENABLED and self.record is not None:
+            getattr(self.record.recorder, f"add_{track}")(ulaw)
 
     async def _barged_in(self, ulaw: bytes) -> bool:
         """Has the caller started talking over the agent?
@@ -220,7 +260,11 @@ class CallSession:
             kind, payload = await self._work.get()
             try:
                 if kind == SAY:
-                    await self._speak(payload)
+                    # The greeting is spoken, not generated, so it never passes
+                    # through _answer - record it or the transcript starts
+                    # mid-conversation.
+                    if await self._speak(payload):
+                        self._remember("assistant", payload)
                 else:
                     await self._answer(payload)
             except asyncio.CancelledError:
@@ -233,6 +277,7 @@ class CallSession:
 
     async def _answer(self, transcript: str) -> None:
         self.history.append({"role": "user", "content": transcript})
+        self._remember("user", transcript)
         reply = await get_ai_reply(self._client, self.history)
         if not reply:
             log("agent: empty reply, saying nothing")
@@ -241,12 +286,9 @@ class CallSession:
         finished = await self._speak(reply)
         # A reply the caller cut off was only half heard. Recording that stops
         # the model assuming it landed and referring back to it next turn.
-        self.history.append(
-            {
-                "role": "assistant",
-                "content": reply if finished else f"{reply} [interrupted by caller]",
-            }
-        )
+        spoken = reply if finished else f"{reply} [interrupted by caller]"
+        self.history.append({"role": "assistant", "content": spoken})
+        self._remember("assistant", spoken)
 
     async def _speak(self, text: str) -> bool:
         """Play `text` into the call. False means the caller cut in."""
@@ -264,25 +306,28 @@ class CallSession:
 
         # Sarvam's chunk sizes and Twilio's 20ms frame clock have nothing to do
         # with each other; this keeps every write frame-aligned regardless.
-        sender = FrameSender(self.websocket, self.stream_sid)
+        sender = FrameSender(
+            self.websocket, self.stream_sid, should_stop=self._interrupt.is_set
+        )
 
         async with contextlib.aclosing(self._audio_for(text)) as audio:
             async for chunk in audio:
                 if self._interrupt.is_set():
                     break
-                await sender.feed(chunk)
 
-                # Only mute the caller once sound is actually going out - the
-                # first chunk can be most of a second away, and they should not
-                # be deaf for that.
+                # Mute the caller from the first frame, not once the chunk has
+                # finished going out: sending is paced to real time now, so a
+                # chunk takes as long to send as it does to play.
                 self._speaking = True
-                # Playback is continuous, so each chunk extends the deadline from
-                # where the last one ended rather than from now. That survives a
-                # generator slower than realtime without un-muting early.
+                # Playback is continuous, so each chunk extends the deadline
+                # from where the last one ended rather than from now.
                 self._speak_until = (
                     max(time.monotonic(), self._speak_until)
                     + len(chunk) / TELEPHONY_SAMPLE_RATE
                 )
+
+                self._record("agent", chunk)
+                await sender.feed(chunk)
 
         interrupted = self._interrupt.is_set()
         if not interrupted:
@@ -310,6 +355,11 @@ class CallSession:
             yield await text_to_speech(self._client, text)
 
     # --- teardown ------------------------------------------------------------
+
+    def _remember(self, role: str, content: str) -> None:
+        """Keep the turn for the CRM write-back after the call ends."""
+        if self.record is not None:
+            self.record.add(role, content)
 
     async def aclose(self) -> None:
         if self._worker is not None:

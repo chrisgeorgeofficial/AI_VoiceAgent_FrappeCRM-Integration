@@ -113,3 +113,82 @@ BARGE_IN = _flag("BARGE_IN", default=True)
 # noisy line keeps cutting the agent off; lower it if it ignores you.
 BARGE_IN_RMS = int(os.getenv("BARGE_IN_RMS", "800"))
 BARGE_IN_FRAMES = int(os.getenv("BARGE_IN_FRAMES", "10"))
+
+
+# --- Frappe CRM --------------------------------------------------------------
+
+# Base URL of the Frappe desk, no trailing slash. The CRM frontend and the desk
+# are different ports; this wants the desk, the one that serves /api/resource.
+FRAPPE_URL = os.getenv("FRAPPE_URL", "").strip().rstrip("/")
+
+# From the user's API Access section. The secret is shown once at generation.
+FRAPPE_API_KEY = os.getenv("FRAPPE_API_KEY", "").strip()
+FRAPPE_API_SECRET = os.getenv("FRAPPE_API_SECRET", "").strip()
+
+# The custom DocType that call results are written to.
+FRAPPE_DOCTYPE = os.getenv("FRAPPE_DOCTYPE", "AI Voice Agent").strip()
+
+# False parks the write-back without removing it: calls still run and the
+# extraction still logs, nothing reaches Frappe.
+CRM_ENABLED = _flag("CRM_ENABLED", default=True)
+
+# Frappe is a local service, but a hung request must not keep a background task
+# alive for ever.
+FRAPPE_TIMEOUT = float(os.getenv("FRAPPE_TIMEOUT", "20"))
+
+# How many finished calls to keep in memory awaiting their status callback.
+# Twilio normally fires within seconds; this is a guard against a leak if it
+# never does.
+TRANSCRIPT_CACHE_SIZE = int(os.getenv("TRANSCRIPT_CACHE_SIZE", "200"))
+
+
+# --- Diagnostics -------------------------------------------------------------
+
+# Echo the caller's own audio straight back and do nothing else: no Sarvam, no
+# TTS, no framing logic. If the caller hears themselves, Twilio plays outbound
+# stream audio and the fault is ours. If they hear nothing, the outbound path
+# itself is broken and no amount of audio-pipeline work will fix it.
+ECHO_TEST = _flag("ECHO_TEST")
+
+
+# --- CRM lead linking --------------------------------------------------------
+
+# Create a lead when the caller's number matches none. False links only to
+# leads that already exist and leaves the field empty otherwise.
+CRM_CREATE_LEADS = _flag("CRM_CREATE_LEADS", default=True)
+
+# Status a newly created lead starts in, and where it says it came from.
+# Both must exist in Frappe (CRM Lead Status / CRM Lead Source).
+CRM_NEW_LEAD_STATUS = os.getenv("CRM_NEW_LEAD_STATUS", "New").strip()
+CRM_NEW_LEAD_SOURCE = os.getenv("CRM_NEW_LEAD_SOURCE", "").strip()
+
+# Who new callers are shared out between. Read live from Frappe: every enabled
+# user holding this role, minus Administrator and Guest. Adding a telecaller in
+# the CRM is then all it takes - nothing here needs editing.
+CRM_TELECALLER_ROLE = os.getenv("CRM_TELECALLER_ROLE", "Sales User").strip()
+
+# Fallback only, for when the role lookup returns nobody or Frappe is
+# unreachable. Leave empty to rely on the role entirely.
+CRM_TELECALLERS = [
+    user.strip()
+    for user in os.getenv("CRM_TELECALLERS", "").split(",")
+    if user.strip()
+]
+
+
+# --- Call recording ----------------------------------------------------------
+
+# Keep the call audio and attach it to the CRM record. Recorded here rather
+# than by Twilio: a Twilio recording URL needs Twilio credentials to fetch, so
+# it would sit in the CRM as a link that 401s for whoever clicks it.
+RECORDING_ENABLED = _flag("RECORDING_ENABLED", default=True)
+
+# Stop recording after this long. 8 kHz stereo PCM16 is ~32 KB/s, so ten
+# minutes is roughly a 19 MB attachment - long enough for any sales call and
+# short enough that a stuck line cannot exhaust memory.
+MAX_RECORDING_SECONDS = int(os.getenv("MAX_RECORDING_SECONDS", "600"))
+
+# Keep the two sides of the call on separate channels - caller left, agent
+# right. Useful for analysis, but on a single earbud or a mono player you hear
+# only one of them, so the default mixes both into one channel.
+RECORDING_STEREO = _flag("RECORDING_STEREO")
