@@ -58,7 +58,8 @@ answer but never stalls the stream.
 
 No AI orchestration framework is used. Structured extraction uses Sarvam's
 native JSON-Schema support, and follow-up dates are computed in Python rather
-than by the model — see *Known limitations* for the reasoning.
+than by the model — see [docs/PRODUCTION.md](docs/PRODUCTION.md) for the
+reasoning.
 
 ---
 
@@ -89,7 +90,7 @@ Desk → **DocType → New**, name it `AI Voice Agent`, and add:
 | `next_action` | Small Text | |
 | `follow_up_at` | Datetime | |
 | `assigned_user` | Link → User | |
-| `transcript_reference` | Attach | a **file**, not text — see limitations |
+| `transcript_reference` | Attach | holds a **file URL**, not text — see [docs/API.md](docs/API.md) |
 | `recording_reference` | Attach | |
 | `review_flag` | Check | |
 
@@ -184,6 +185,7 @@ Frappe users are created during setup; passwords are whatever you set then.
 | | |
 |---|---|
 | [docs/API.md](docs/API.md) | every endpoint we expose and every provider API we consume, with request/response shapes and the vendor quirks that matter |
+| [docs/PRODUCTION.md](docs/PRODUCTION.md) | what is ready, what is not, and what to fix first before real traffic |
 | [docs/GUIDE.md](docs/GUIDE.md) | what the system does in plain English, plus the problems hit while building it and how each was diagnosed |
 | [docs/crm_call_button.js](docs/crm_call_button.js) | the Frappe Client Script for the "Call with AI Agent" button |
 
@@ -202,3 +204,26 @@ Frappe users are created during setup; passwords are whatever you set then.
 
 ---
 
+---
+
+## Known limitations
+
+**This is a working prototype, not production software.** The full assessment —
+blockers, capacity limits, data-loss paths, privacy and a prioritised fix list —
+is in [docs/PRODUCTION.md](docs/PRODUCTION.md).
+
+The three things to fix before any real traffic:
+
+1. **The Twilio webhook signature is not validated.** Anyone who learns the
+   public URL can post fabricated calls.
+2. **`/voice/trigger-outbound` has no authentication.** CORS restricts browsers;
+   it is not access control, and any non-browser client ignores it.
+3. **A free ngrok tunnel drops calls silently** — the caller hears nothing while
+   the server log shows no error.
+
+And two that shape what it can do today:
+
+- **It runs as a single process.** Call state is held in memory, so
+  `--workers 2` would silently lose call data.
+- **The agent can invent facts** — in testing it quoted a price nobody gave it.
+  Put your real price list in the prompt before letting it near customers.
