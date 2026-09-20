@@ -34,6 +34,18 @@ def pcm16_to_ulaw(pcm_bytes: bytes) -> bytes:
     return audioop.lin2ulaw(pcm_bytes, SAMPLE_WIDTH)
 
 
+def rms(pcm_bytes: bytes) -> int:
+    """How loud a PCM16 frame is.
+
+    Used to notice the caller talking over the agent. Energy is the only signal
+    cheap enough for the job: waiting for a transcript would cost about a second,
+    which is most of what barging in is meant to save.
+    """
+    if not pcm_bytes:
+        return 0
+    return audioop.rms(pcm_bytes, SAMPLE_WIDTH)
+
+
 def wrap_as_wav(pcm_bytes: bytes, sample_rate: int = TELEPHONY_SAMPLE_RATE) -> bytes:
     """Put a WAV header on raw PCM16.
 

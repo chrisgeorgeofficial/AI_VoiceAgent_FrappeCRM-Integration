@@ -94,3 +94,22 @@ GREETING_TEXT = os.getenv(
 
 # How much of the conversation to replay to the LLM each turn, in messages.
 HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "10"))
+
+
+# --- Speech pacing -----------------------------------------------------------
+
+# True: play each piece of the reply as Sarvam renders it (~0.7s to first audio).
+# False: wait for the whole clip (~2.0s), which is the simpler, older path.
+TTS_STREAMING = _flag("TTS_STREAMING", default=True)
+
+# Let the caller talk over the agent and have it stop. Detection is by audio
+# energy, not by transcript - waiting for words would cost the second that
+# barging in exists to save.
+BARGE_IN = _flag("BARGE_IN", default=True)
+
+# How loud an inbound frame must be to count as speech, and for how many frames
+# running. 10 frames is 200ms: long enough to ignore a cough, a keypress or a
+# bump on the line, short enough to feel immediate. Raise BARGE_IN_RMS if a
+# noisy line keeps cutting the agent off; lower it if it ignores you.
+BARGE_IN_RMS = int(os.getenv("BARGE_IN_RMS", "800"))
+BARGE_IN_FRAMES = int(os.getenv("BARGE_IN_FRAMES", "10"))

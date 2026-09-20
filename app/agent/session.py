@@ -14,22 +14,27 @@ import asyncio
 import base64
 import contextlib
 import time
+from collections import deque
 
 from fastapi import WebSocket
 
 from app.agent.client import MissingApiKey, get_client
 from app.agent.llm import get_ai_reply
 from app.agent.stt import Transcriber
-from app.agent.tts import text_to_speech
-from app.audio.codec import TELEPHONY_SAMPLE_RATE
+from app.agent.tts import stream_speech, text_to_speech
+from app.audio.codec import TELEPHONY_SAMPLE_RATE, rms, ulaw_to_pcm16
 from app.config import (
     AGENT_REPLY_ENABLED,
+    BARGE_IN,
+    BARGE_IN_FRAMES,
+    BARGE_IN_RMS,
     GREETING_TEXT,
     HALF_DUPLEX,
     LOG_MEDIA_EVERY,
+    TTS_STREAMING,
 )
 from app.logging_utils import log
-from app.telephony.outbound import send_audio, send_mark
+from app.telephony.outbound import FrameSender, send_clear, send_mark
 
 # Queue items. "say" speaks fixed text; "turn" runs a transcript through the
 # model first.
@@ -61,6 +66,14 @@ class CallSession:
         self._speak_until = 0.0
         self._mark = 0
         self._awaiting_mark = ""
+
+        # Set when the caller talks over the agent; the playback loop watches it.
+        self._interrupt = asyncio.Event()
+        self._loud_frames = 0
+        # The caller's first word arrives while we are still deciding whether it
+        # was speech at all. Hold those frames so they can be replayed into STT
+        # rather than lost to the decision.
+        self._prebuffer: deque[bytes] = deque(maxlen=BARGE_IN_FRAMES + 5)
 
         self._media_frames = 0
         self._dropped_frames = 0
@@ -120,29 +133,71 @@ class CallSession:
         if self._transcriber is None:
             return
 
+        payload = frame.get("media", {}).get("payload")
+        if not payload:
+            return
+        ulaw = base64.b64decode(payload)
+
         # The caller's line carries our own voice back while we are talking.
         # Feeding that to STT makes the agent answer itself.
         if HALF_DUPLEX and self._speaking:
-            if time.monotonic() < self._speak_until:
+            if time.monotonic() >= self._speak_until:
+                # Twilio's mark echo is the precise signal, but it is not
+                # guaranteed to arrive. Without this the agent stayed deaf for
+                # the whole call - which is exactly what happened once.
+                log("twilio: no mark came back; the clip is over, listening again")
+                self._stop_speaking()
+            elif await self._barged_in(ulaw):
+                return  # this frame already went in with the prebuffer
+            else:
                 self._dropped_frames += 1
                 return
-            # Twilio's mark echo is the precise signal, but it is not guaranteed
-            # to arrive. Without this the agent stays deaf for the whole call.
-            log("twilio: no mark came back; the clip is over, listening again")
-            self._speaking = False
-            self._awaiting_mark = ""
 
-        payload = frame.get("media", {}).get("payload")
-        if payload:
-            await self._transcriber.feed(base64.b64decode(payload))
+        await self._transcriber.feed(ulaw)
+
+    async def _barged_in(self, ulaw: bytes) -> bool:
+        """Has the caller started talking over the agent?
+
+        Judged on loudness sustained across consecutive frames. A single loud
+        frame is a door slam or a click; a fifth of a second of them is a person.
+        """
+        if not BARGE_IN:
+            return False
+
+        self._prebuffer.append(ulaw)
+
+        if rms(ulaw_to_pcm16(ulaw)) < BARGE_IN_RMS:
+            # A quiet frame breaks the run: we want sustained speech, not noise.
+            self._loud_frames = 0
+            return False
+
+        self._loud_frames += 1
+        if self._loud_frames < BARGE_IN_FRAMES:
+            return False
+
+        log(f"agent: caller cut in ({self._loud_frames} loud frames) - stopping")
+        self._interrupt.set()
+        self._stop_speaking()
+        # Drop whatever Twilio has buffered but not yet played, or the agent
+        # keeps talking for seconds after we stopped sending.
+        await send_clear(self.websocket, self.stream_sid)
+
+        for held in self._prebuffer:
+            await self._transcriber.feed(held)
+        self._prebuffer.clear()
+        return True
+
+    def _stop_speaking(self) -> None:
+        self._speaking = False
+        self._awaiting_mark = ""
+        self._loud_frames = 0
 
     def _on_mark(self, frame: dict) -> None:
         name = frame.get("mark", {}).get("name", "")
         log(f"twilio: mark {name!r} (awaiting {self._awaiting_mark!r})")
         if name == self._awaiting_mark:
             log(f"twilio: finished playing {name}; listening again")
-            self._speaking = False
-            self._awaiting_mark = ""
+            self._stop_speaking()
 
     async def _on_stop(self) -> None:
         log("twilio: stop")
@@ -172,7 +227,7 @@ class CallSession:
                 raise
             except Exception as exc:  # noqa: BLE001 - one bad turn is not a dead call
                 log(f"agent: turn failed: {type(exc).__name__}: {exc}")
-                self._speaking = False
+                self._stop_speaking()
             finally:
                 self._work.task_done()
 
@@ -182,24 +237,77 @@ class CallSession:
         if not reply:
             log("agent: empty reply, saying nothing")
             return
-        self.history.append({"role": "assistant", "content": reply})
-        await self._speak(reply)
 
-    async def _speak(self, text: str) -> None:
-        ulaw = await text_to_speech(self._client, text)
+        finished = await self._speak(reply)
+        # A reply the caller cut off was only half heard. Recording that stops
+        # the model assuming it landed and referring back to it next turn.
+        self.history.append(
+            {
+                "role": "assistant",
+                "content": reply if finished else f"{reply} [interrupted by caller]",
+            }
+        )
+
+    async def _speak(self, text: str) -> bool:
+        """Play `text` into the call. False means the caller cut in."""
         if not self.stream_sid:
             log("!! no streamSid yet - cannot send audio")
-            return
+            return True
 
-        seconds = len(ulaw) / TELEPHONY_SAMPLE_RATE
+        self._interrupt.clear()
+        self._prebuffer.clear()
+        self._loud_frames = 0
         self._mark += 1
         self._awaiting_mark = f"reply-{self._mark}"
-        self._speaking = True
-        self._speak_until = time.monotonic() + seconds + SPEECH_TAIL_MARGIN
+        # Left over from the previous utterance; the loop accumulates afresh.
+        self._speak_until = 0.0
 
-        await send_audio(self.websocket, self.stream_sid, ulaw)
-        await send_mark(self.websocket, self.stream_sid, self._awaiting_mark)
-        log(f"agent: sent {self._awaiting_mark} ({seconds:.1f}s of audio)")
+        # Sarvam's chunk sizes and Twilio's 20ms frame clock have nothing to do
+        # with each other; this keeps every write frame-aligned regardless.
+        sender = FrameSender(self.websocket, self.stream_sid)
+
+        async with contextlib.aclosing(self._audio_for(text)) as audio:
+            async for chunk in audio:
+                if self._interrupt.is_set():
+                    break
+                await sender.feed(chunk)
+
+                # Only mute the caller once sound is actually going out - the
+                # first chunk can be most of a second away, and they should not
+                # be deaf for that.
+                self._speaking = True
+                # Playback is continuous, so each chunk extends the deadline from
+                # where the last one ended rather than from now. That survives a
+                # generator slower than realtime without un-muting early.
+                self._speak_until = (
+                    max(time.monotonic(), self._speak_until)
+                    + len(chunk) / TELEPHONY_SAMPLE_RATE
+                )
+
+        interrupted = self._interrupt.is_set()
+        if not interrupted:
+            await sender.flush()
+
+        if sender.sent and not interrupted:
+            self._speak_until += SPEECH_TAIL_MARGIN
+            await send_mark(self.websocket, self.stream_sid, self._awaiting_mark)
+
+        log(
+            f"agent: {'cut off after' if interrupted else 'sent'} "
+            f"{sender.sent / TELEPHONY_SAMPLE_RATE:.1f}s of audio"
+        )
+        return not interrupted
+
+    async def _audio_for(self, text: str):
+        """Mu-law for `text`: streamed as it renders, or one buffered lump."""
+        if TTS_STREAMING:
+            async with contextlib.aclosing(
+                stream_speech(self._client, text)
+            ) as stream:
+                async for chunk in stream:
+                    yield chunk
+        else:
+            yield await text_to_speech(self._client, text)
 
     # --- teardown ------------------------------------------------------------
 
