@@ -73,6 +73,9 @@ class CallSession:
         self._speak_until = 0.0
         self._mark = 0
         self._awaiting_mark = ""
+        # Set if Twilio ever confirms it played something we sent.
+        self._probe = ""
+        self._heard = False
 
         # Set when the caller talks over the agent; the playback loop watches it.
         self._interrupt = asyncio.Event()
@@ -234,6 +237,10 @@ class CallSession:
 
     def _on_mark(self, frame: dict) -> None:
         name = frame.get("mark", {}).get("name", "")
+        if name == self._probe:
+            log(f"twilio: CONFIRMED PLAYING - {name} echoed back")
+            self._heard = True
+            return
         log(f"twilio: mark {name!r} (awaiting {self._awaiting_mark!r})")
         if name == self._awaiting_mark:
             log(f"twilio: finished playing {name}; listening again")
@@ -301,6 +308,8 @@ class CallSession:
         self._loud_frames = 0
         self._mark += 1
         self._awaiting_mark = f"reply-{self._mark}"
+        self._probe = f"playing-{self._mark}"
+        probed = False
         # Left over from the previous utterance; the loop accumulates afresh.
         self._speak_until = 0.0
 
@@ -328,6 +337,14 @@ class CallSession:
 
                 self._record("agent", chunk)
                 await sender.feed(chunk)
+
+                if not probed and sender.sent:
+                    # A mark right after the first audio. Twilio echoes a mark
+                    # once everything before it has PLAYED, so getting this one
+                    # back proves the caller is hearing us - the signal every
+                    # silent call so far has been missing.
+                    probed = True
+                    await send_mark(self.websocket, self.stream_sid, self._probe)
 
         interrupted = self._interrupt.is_set()
         if not interrupted:
@@ -374,3 +391,7 @@ class CallSession:
             f"agent: call finished - {self._media_frames} frames, "
             f"{len(self.history)} messages exchanged"
         )
+        if self._mark and not self._heard:
+            log("!! agent: Twilio never confirmed playing ANY of our audio - "
+                "the caller heard silence. The audio left this server fine; "
+                "it did not come back as played.")

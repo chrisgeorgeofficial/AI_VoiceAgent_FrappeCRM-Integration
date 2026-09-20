@@ -9,7 +9,7 @@ a code fence should cost us a tidy record, not the whole call.
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sarvamai import AsyncSarvamAI
@@ -22,6 +22,12 @@ from app.logging_utils import log
 LEAD_INTEREST = ["Hot", "Warm", "Cold"]
 OBJECTIONS = ["Price", "Timing", "Competitor", "No need", "Other"]
 
+FOLLOW_UP_DAYS = [
+    "today", "tomorrow", "monday", "tuesday", "wednesday", "thursday",
+    "friday", "saturday", "sunday", "next_week", "in_two_weeks",
+    "next_month",
+]
+
 SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -33,7 +39,8 @@ SCHEMA: dict[str, Any] = {
         "primary_objection",
         "call_summary",
         "next_action",
-        "follow_up_at",
+        "follow_up_when",
+        "follow_up_time_of_day",
         "review_flag",
     ],
     "properties": {
@@ -59,9 +66,24 @@ SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": "The single concrete next step.",
         },
-        "follow_up_at": {
+        "follow_up_when": {
+            # An enum, not free text: asked for a string the model answered
+            # "Thursday morning" - the whole phrase - and the day was lost.
+            # The enum fields in this schema have never once come back wrong.
             "type": ["string", "null"],
-            "description": "When to follow up, as 'YYYY-MM-DD HH:MM:SS', or null.",
+            "enum": [None, *FOLLOW_UP_DAYS],
+            "description": (
+                "Which day the caller asked to be contacted, or null if "
+                "none was agreed. Name the day only - the time of day goes "
+                "in follow_up_time_of_day."
+            ),
+        },
+        "follow_up_time_of_day": {
+            "type": ["string", "null"],
+            "description": (
+                "morning, afternoon, evening, or an exact 24-hour HH:MM. "
+                "Null if the caller did not say."
+            ),
         },
         "review_flag": {
             "type": "boolean",
@@ -81,17 +103,20 @@ SYSTEM_PROMPT = (
     "complained about cost or price, the objection is 'Price'; if they were "
     "happy but not ready yet, it is 'Timing'. Set review_flag to true when the "
     "call was too short, unclear or cut off to be trusted. "
-    "The current date and time is {now} ({weekday}). Resolve anything relative "
-    "the caller said - 'Tuesday', 'next month', 'in a week' - into an absolute "
-    "timestamp in exactly the format YYYY-MM-DD HH:MM:SS. Never answer with a "
-    "day name or a phrase; use null if no follow-up was agreed."
+    "It is now {now} ({weekday}). For follow_up_when, answer with the exact day "
+    "the caller named: if they said Tuesday, answer 'tuesday', even though that "
+    "falls in the week ahead. Only answer 'next_week', 'in_two_weeks' or "
+    "'next_month' when the caller named no particular day. Put the time of day "
+    "in follow_up_time_of_day, or null if they did not say one. Never work out "
+    "a calendar date - that is done for you."
 )
 
 
 def system_prompt() -> str:
     now = datetime.now()
     return SYSTEM_PROMPT.format(
-        now=now.strftime("%Y-%m-%d %H:%M:%S"), weekday=now.strftime("%A")
+        now=now.strftime("%Y-%m-%d %H:%M:%S"),
+        weekday=now.strftime("%A"),
     )
 
 # Returned when the model cannot be parsed at all. The call is still recorded,
@@ -104,6 +129,8 @@ FALLBACK = {
     "primary_objection": "Other",
     "call_summary": "Automatic analysis failed; see the transcript.",
     "next_action": "Review the transcript manually.",
+    "follow_up_when": None,
+    "follow_up_time_of_day": None,
     "follow_up_at": None,
     "review_flag": True,
 }
@@ -122,7 +149,10 @@ async def extract_call_fields(client: AsyncSarvamAI, transcript: str) -> dict:
                 {"role": "user", "content": transcript},
             ],
             model=SARVAM_CHAT_MODEL,
-            temperature=0.1,
+            # Nothing here benefits from variety: the same transcript should
+            # always classify the same way, and at 0.1 the follow-up day
+            # occasionally wandered.
+            temperature=0.0,
             max_tokens=600,
             response_format={
                 "type": "json_schema",
@@ -181,12 +211,13 @@ def _coerce(fields: dict) -> dict:
         log(f"extract: unexpected objection {out['primary_objection']!r}")
         out["primary_objection"], flagged = "Other", True
 
-    follow_up, follow_up_ok = _as_datetime(out.get("follow_up_at"))
-    if not follow_up_ok:
-        # A Datetime field will not take "Tuesday" or "next week". Rather than
-        # let one soft field fail the whole write, drop it and flag the record -
-        # the phrasing survives in next_action either way.
-        log(f"extract: unusable follow_up_at {out['follow_up_at']!r}, dropping it")
+    follow_up = resolve_follow_up(
+        out.get("follow_up_when"), out.get("follow_up_time_of_day")
+    )
+    if out.get("follow_up_when") and follow_up is None:
+        # The model named a day nobody recognises. The phrasing survives in
+        # next_action; flag it rather than guess at a date.
+        log(f"extract: unusable follow_up_when {out['follow_up_when']!r}")
         flagged = True
     out["follow_up_at"] = follow_up
 
@@ -200,26 +231,68 @@ def _coerce(fields: dict) -> dict:
     return out
 
 
-# What Frappe accepts, plus the shapes a model tends to produce anyway.
-_DATETIME_FORMATS = (
-    "%Y-%m-%d %H:%M:%S",
-    "%Y-%m-%dT%H:%M:%S",
-    "%Y-%m-%d %H:%M",
-    "%Y-%m-%d",
-)
+WEEKDAYS = [
+    "monday", "tuesday", "wednesday", "thursday",
+    "friday", "saturday", "sunday",
+]
+
+# What the caller means by a part of the day, and what a bare day defaults to.
+TIMES_OF_DAY = {"morning": 9, "afternoon": 14, "evening": 17}
+DEFAULT_HOUR = 10
+
+OFFSETS = {"today": 0, "tomorrow": 1, "next_week": 7, "in_two_weeks": 14,
+           "next_month": 30}
 
 
-def _as_datetime(value: Any) -> tuple[str | None, bool]:
-    """Normalise to 'YYYY-MM-DD HH:MM:SS'. Returns (value, was_understood)."""
-    if value is None:
-        return None, True
-    text = str(value).strip()
-    if text.lower() in {"", "null", "none"}:
-        return None, True
+def resolve_follow_up(when, time_of_day, now: datetime | None = None) -> str | None:
+    """Turn "thursday" + "morning" into a timestamp Frappe will accept.
 
-    for fmt in _DATETIME_FORMATS:
+    The model is asked which day the caller wanted, never which date. Given
+    only today's date it computed the rest itself and got "Thursday morning"
+    wrong three different ways across three runs; given a fortnight's calendar
+    it picked the second Friday instead of the first. Naming a day is something
+    it does reliably, so the counting happens here, where it is deterministic
+    and testable without calling anything.
+    """
+    if not when:
+        return None
+
+    now = now or datetime.now()
+    key = str(when).strip().lower().replace(" ", "_").replace("-", "_")
+
+    # The enum should make this unnecessary, but a phrase like "thursday_morning"
+    # still resolves to the right day rather than to nothing at all.
+    if key not in OFFSETS and key not in WEEKDAYS:
+        for token in (*OFFSETS, *WEEKDAYS):
+            if token in key:
+                key = token
+                break
+
+    if key in OFFSETS:
+        day = (now + timedelta(days=OFFSETS[key])).date()
+    elif key in WEEKDAYS:
+        # The soonest one that has not happened yet; "monday" said on a Monday
+        # means the Monday coming, not today.
+        ahead = (WEEKDAYS.index(key) - now.weekday()) % 7 or 7
+        day = (now + timedelta(days=ahead)).date()
+    else:
         try:
-            return datetime.strptime(text, fmt).strftime("%Y-%m-%d %H:%M:%S"), True
+            day = datetime.strptime(str(when).strip(), "%Y-%m-%d").date()
         except ValueError:
-            continue
-    return None, False
+            return None
+
+    hour, minute = DEFAULT_HOUR, 0
+    spoken = str(time_of_day or "").strip().lower()
+    if spoken in TIMES_OF_DAY:
+        hour = TIMES_OF_DAY[spoken]
+    elif ":" in spoken:
+        try:
+            hh, mm = spoken.split(":")[:2]
+            hour, minute = int(hh), int(mm)
+        except ValueError:
+            pass
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        hour, minute = DEFAULT_HOUR, 0
+
+    return f"{day} {hour:02d}:{minute:02d}:00"

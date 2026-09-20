@@ -192,3 +192,37 @@ MAX_RECORDING_SECONDS = int(os.getenv("MAX_RECORDING_SECONDS", "600"))
 # right. Useful for analysis, but on a single earbud or a mono player you hear
 # only one of them, so the default mixes both into one channel.
 RECORDING_STEREO = _flag("RECORDING_STEREO")
+
+
+# --- Outbound calling --------------------------------------------------------
+
+# From the Twilio console. The account SID also appears on every inbound
+# webhook; the auth token is only shown in the console.
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+
+# The Twilio number calls are placed from.
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "").strip()
+
+# Public https base for the URLs Twilio fetches - the ngrok address. Falls back
+# to PUBLIC_HOST so there is one less thing to keep in step.
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/") or (
+    f"https://{PUBLIC_HOST}" if PUBLIC_HOST else ""
+)
+
+# Origins allowed to call /voice/trigger-outbound from a browser. The Frappe
+# desk is served from a different port, so the CRM's "Call with AI Agent"
+# button is a cross-origin request and is blocked without this.
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", FRAPPE_URL).split(",")
+    if origin.strip()
+]
+
+
+# --- Follow-up tasks ---------------------------------------------------------
+
+# Open a CRM Task when a call leaves something to do. Frappe CRM has no plain
+# "Task" doctype - CRM Task is the one the lead view shows.
+FOLLOW_UP_TASKS = _flag("FOLLOW_UP_TASKS", default=True)
+FOLLOW_UP_TASK_STATUS = os.getenv("FOLLOW_UP_TASK_STATUS", "Todo").strip()

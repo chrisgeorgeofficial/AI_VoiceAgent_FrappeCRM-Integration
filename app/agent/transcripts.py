@@ -27,6 +27,8 @@ class CallRecord:
     from_number: str = ""
     to_number: str = ""
     direction: str = "inbound"
+    # Set when we placed the call and already know who we are ringing.
+    lead: str = ""
     started_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )

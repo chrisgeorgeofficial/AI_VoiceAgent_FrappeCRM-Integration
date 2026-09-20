@@ -91,6 +91,23 @@ async def _query(client: httpx.AsyncClient, filters: list) -> list[dict]:
     return response.json().get("data", [])
 
 
+async def get_lead(client: httpx.AsyncClient, name: str) -> dict | None:
+    """Fetch one lead by id.
+
+    Used when a call was placed for a known lead: its number may be stored
+    differently, or shared with another record, so matching by phone could pick
+    the wrong one - and with it the wrong owner.
+    """
+    response = await client.get(
+        f"{FRAPPE_URL}/api/resource/{LEAD_DOCTYPE}/{name}",
+        headers=_headers(),
+    )
+    if response.status_code >= 400:
+        log(f"crm: lead {name} could not be read: HTTP {response.status_code}")
+        return None
+    return response.json().get("data")
+
+
 async def create_lead(
     client: httpx.AsyncClient, phone: str, caller_name: str, owner: str
 ) -> dict | None:

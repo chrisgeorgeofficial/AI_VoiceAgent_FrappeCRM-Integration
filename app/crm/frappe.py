@@ -121,12 +121,13 @@ async def attach_file(
 
 async def save_call_result(
     payload: dict, transcript: str = "", recording: bytes = b""
-) -> dict | None:
+) -> tuple[dict | None, bool]:
     """Write one call result, skipping it if this call is already recorded.
 
-    Returns the record, or None if it could not be written. Never raises: this
-    runs in a background task after the caller has already hung up, and there
-    is nobody left to hand an exception to.
+    Returns (record, created). `created` is False when the call was already on
+    file, which matters because Twilio retries callbacks and a retry must not
+    open a second follow-up task. Never raises: this runs in a background task
+    after the caller has hung up, and there is nobody to hand an exception to.
     """
     call_id = payload.get("provider_call_id", "")
 
@@ -135,7 +136,7 @@ async def save_call_result(
             existing = await find_call_result(client, call_id)
             if existing:
                 log(f"frappe: {call_id} already recorded as {existing['name']}, skipping")
-                return existing
+                return existing, False
 
             created = await create_call_result(client, payload)
             name = created.get("name")
@@ -155,7 +156,7 @@ async def save_call_result(
                     f"{name}-recording.wav", recording, "audio/wav",
                 )
 
-            return created
+            return created, True
 
     except FrappeNotConfigured as exc:
         log(f"!! frappe: {exc}")
@@ -166,7 +167,7 @@ async def save_call_result(
     except Exception as exc:  # noqa: BLE001 - a lost record must not crash the app
         log(f"!! frappe: unexpected failure for {call_id}: {type(exc).__name__}: {exc}")
 
-    return None
+    return None, False
 
 
 async def _try_attach(

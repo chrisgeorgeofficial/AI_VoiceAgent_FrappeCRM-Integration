@@ -15,7 +15,8 @@ import httpx
 
 from app.config import CRM_ENABLED, FRAPPE_TIMEOUT, SARVAM_LANGUAGE
 from app.crm.frappe import save_call_result
-from app.crm.leads import choose_assignee, create_lead, find_lead
+from app.crm.leads import choose_assignee, create_lead, find_lead, get_lead
+from app.crm.tasks import create_follow_up_task
 from app.logging_utils import log
 
 # Twilio's call statuses mapped onto the DocType's Select options. Frappe
@@ -31,6 +32,9 @@ CALL_STATUS = {
 
 # The call is over and worth recording at these statuses, and only these.
 TERMINAL = set(CALL_STATUS)
+
+# Extracted for our own use, not columns on the DocType.
+INTERNAL_FIELDS = {"caller_name", "follow_up_when", "follow_up_time_of_day"}
 
 # The DocType's language Select, keyed by Sarvam's BCP-47 code.
 LANGUAGES = {"en-IN": "English", "ml-IN": "Malayalam"}
@@ -67,8 +71,22 @@ async def process_completed_call(form: dict) -> None:
     if recording:
         log(f"crm: recording is {record.recorder.seconds:.0f}s, {len(recording)} bytes")
 
-    if await save_call_result(payload, transcript, recording) is not None:
-        transcripts.drop(call_sid)
+    saved, created = await save_call_result(payload, transcript, recording)
+    if saved is None:
+        return
+
+    if created:
+        await _open_follow_up(saved.get("name", ""), lead, assignee, fields)
+    transcripts.drop(call_sid)
+
+
+async def _open_follow_up(record: str, lead: str, assignee: str, fields: dict) -> None:
+    """Leave a task behind if the call left something to do."""
+    try:
+        async with httpx.AsyncClient(timeout=FRAPPE_TIMEOUT) as client:
+            await create_follow_up_task(client, record, lead, assignee, fields)
+    except Exception as exc:  # noqa: BLE001 - the call result is already saved
+        log(f"!! crm: could not open a follow-up task: {type(exc).__name__}: {exc}")
 
 
 async def _link_to_lead(form: dict, record, fields: dict) -> tuple[str, str]:
@@ -77,14 +95,27 @@ async def _link_to_lead(form: dict, record, fields: dict) -> tuple[str, str]:
     A caller already on someone's list stays with them. Only a number nobody
     owns goes into the round-robin.
     """
-    phone = form.get("From") or (record.from_number if record else "")
+    # On an inbound call the customer is From; on one we placed, they are To.
+    outbound = _direction(form, record) == "outbound"
+    phone = (form.get("To") if outbound else form.get("From")) or (
+        record.from_number if record else ""
+    )
     if not phone:
-        log("crm: no caller number available, cannot link a lead")
+        log("crm: no customer number available, cannot link a lead")
         return "", ""
 
     try:
         async with httpx.AsyncClient(timeout=FRAPPE_TIMEOUT) as client:
-            lead = await find_lead(client, phone)
+            # An outbound call already knows which lead it is about.
+            known = getattr(record, "lead", "") if record else ""
+            if known:
+                # Read the lead we actually dialled. Matching on the number
+                # instead can land on a different record that happens to share
+                # it, and take the call away from its real owner.
+                log(f"crm: call was placed for lead {known}")
+                lead = await get_lead(client, known) or {"name": known}
+            else:
+                lead = await find_lead(client, phone)
             assignee = await choose_assignee(client, lead)
 
             if lead is None:
@@ -128,9 +159,10 @@ def _build_payload(form: dict, record, status: str, fields: dict) -> dict:
         "call_duration": _duration(form),
         # transcript_reference and recording_reference are Attach fields, filled
         # in after the record exists by uploading files to it.
-        # caller_name is extracted for naming a new lead; the DocType has no
-        # such field, and Frappe rejects a payload key it does not know.
-        **{k: v for k, v in fields.items() if k != "caller_name"},
+        # Some extracted fields are for our own use - naming a new lead, or
+        # working out the follow-up date. Frappe rejects a key it does not
+        # know, so only the DocType's own fields go through.
+        **{k: v for k, v in fields.items() if k not in INTERNAL_FIELDS},
     }
     # Frappe wants a Datetime or the field absent; the string "null" is neither.
     if payload.get("follow_up_at") is None:
