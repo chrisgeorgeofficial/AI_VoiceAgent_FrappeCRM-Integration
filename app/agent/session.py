@@ -21,17 +21,19 @@ from fastapi import WebSocket
 from app.agent import transcripts
 from app.agent.client import MissingApiKey, get_client
 from app.agent.llm import get_ai_reply
+from app.agent.persona import greeting_for
 from app.agent.stt import Transcriber
 from app.agent.tts import stream_speech, text_to_speech
 from app.audio.codec import TELEPHONY_SAMPLE_RATE, rms, ulaw_to_pcm16
+from app.crm.context import Caller, load_caller
 from app.config import (
     AGENT_REPLY_ENABLED,
     ECHO_TEST,
     RECORDING_ENABLED,
     BARGE_IN,
     BARGE_IN_FRAMES,
+    BARGE_IN_GRACE_MS,
     BARGE_IN_RMS,
-    GREETING_TEXT,
     HALF_DUPLEX,
     LOG_MEDIA_EVERY,
     TTS_STREAMING,
@@ -61,6 +63,8 @@ class CallSession:
         # Outlives this object: the status callback arrives after the socket
         # has closed and can only find the conversation by CallSid.
         self.record: transcripts.CallRecord | None = None
+        # Who we are speaking to, read from the CRM before the first word.
+        self.caller = Caller()
 
         self._client = None
         self._transcriber: Transcriber | None = None
@@ -76,6 +80,11 @@ class CallSession:
         # Set if Twilio ever confirms it played something we sent.
         self._probe = ""
         self._heard = False
+        # When the current clip started playing, for the barge-in grace period.
+        self._speech_started = 0.0
+        # The last language we were confident about, so an unclear turn
+        # continues the conversation rather than switching to the default.
+        self.last_language = ""
 
         # Set when the caller talks over the agent; the playback loop watches it.
         self._interrupt = asyncio.Event()
@@ -129,11 +138,21 @@ class CallSession:
 
         self._worker = asyncio.create_task(self._run_worker())
 
+        # Find out who this is before speaking. It is a query against a local
+        # Frappe, and it decides both what the agent says first and what it is
+        # told not to ask again.
+        self.caller = await load_caller(
+            phone=self.record.from_number if self.record else "",
+            lead_id=self.record.lead if self.record else "",
+            direction=self.record.direction if self.record else "inbound",
+        )
+
         # Queue the greeting before opening the STT socket, not after. The two
         # are independent, and waiting for Sarvam to connect first left the
         # caller listening to about a second of nothing.
-        if GREETING_TEXT:
-            self._work.put_nowait((SAY, GREETING_TEXT))
+        greeting = greeting_for(self.caller)
+        if greeting:
+            self._work.put_nowait((SAY, greeting))
 
         transcriber = Transcriber(self._client, self._on_transcript)
         try:
@@ -209,6 +228,10 @@ class CallSession:
 
         self._prebuffer.append(ulaw)
 
+        # Line noise at the top of a clip is not the caller talking over us.
+        if (time.monotonic() - self._speech_started) * 1000 < BARGE_IN_GRACE_MS:
+            return False
+
         if rms(ulaw_to_pcm16(ulaw)) < BARGE_IN_RMS:
             # A quiet frame breaks the run: we want sustained speech, not noise.
             self._loud_frames = 0
@@ -254,8 +277,15 @@ class CallSession:
     # --- the turn loop -------------------------------------------------------
 
     async def _on_transcript(self, transcript: str, language: str = "") -> None:
-        if language and self.record is not None:
-            self.record.languages.add(language)
+        if language:
+            self.last_language = language
+            if self.record is not None:
+                self.record.languages.add(language)
+        elif self.last_language:
+            # Sarvam was unsure about this turn. Carrying on in the language the
+            # caller has been using beats dropping back to English mid-sentence.
+            language = self.last_language
+            log(f"stt: language unclear, continuing in {language}")
 
         if not AGENT_REPLY_ENABLED:
             # Step 18's checkpoint: prove transcription works on its own before
@@ -290,7 +320,9 @@ class CallSession:
         self._remember("user", transcript)
         # The language travels with the turn: the model is told which one to
         # answer in, and the voice speaks that same one back.
-        reply = await get_ai_reply(self._client, self.history, language)
+        reply = await get_ai_reply(
+            self._client, self.history, language, self.caller
+        )
         if not reply:
             log("agent: empty reply, saying nothing")
             return
@@ -332,6 +364,8 @@ class CallSession:
                 # Mute the caller from the first frame, not once the chunk has
                 # finished going out: sending is paced to real time now, so a
                 # chunk takes as long to send as it does to play.
+                if not self._speaking:
+                    self._speech_started = time.monotonic()
                 self._speaking = True
                 # Playback is continuous, so each chunk extends the deadline
                 # from where the last one ended rather than from now.

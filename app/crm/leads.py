@@ -23,7 +23,13 @@ from app.crm.frappe import _headers
 from app.logging_utils import log
 
 LEAD_DOCTYPE = "CRM Lead"
-LEAD_FIELDS = '["name","lead_name","mobile_no","phone","lead_owner","modified"]'
+# status and converted decide whether this is a prospect or an existing
+# customer, which changes the whole conversation - they have to come back
+# with the match, not just with a direct fetch.
+LEAD_FIELDS = (
+    '["name","lead_name","first_name","mobile_no","phone","lead_owner",'
+    '"status","converted","modified"]'
+)
 
 # Indian mobile numbers are 10 digits; that is the most that can be compared
 # without matching two different people who share a country code.

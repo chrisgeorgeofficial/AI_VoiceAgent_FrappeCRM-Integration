@@ -114,6 +114,12 @@ BARGE_IN = _flag("BARGE_IN", default=True)
 BARGE_IN_RMS = int(os.getenv("BARGE_IN_RMS", "800"))
 BARGE_IN_FRAMES = int(os.getenv("BARGE_IN_FRAMES", "10"))
 
+# Ignore interruptions for this long after the agent starts a clip. The first
+# second of a call carries line noise and the tail of the network's own
+# announcements, and a greeting cut off at 2.6s leaves the caller with
+# nothing - which is exactly what one observed call did.
+BARGE_IN_GRACE_MS = int(os.getenv("BARGE_IN_GRACE_MS", "1200"))
+
 
 # --- Frappe CRM --------------------------------------------------------------
 
@@ -238,4 +244,36 @@ SARVAM_AUTO_LANGUAGE = _flag("SARVAM_AUTO_LANGUAGE", default=True)
 
 # Ignore a detected language the model is unsure about, rather than answering
 # in the wrong one. Measured confidence on clean speech is around 0.96-0.98.
-LANGUAGE_MIN_CONFIDENCE = float(os.getenv("LANGUAGE_MIN_CONFIDENCE", "0.6"))
+LANGUAGE_MIN_CONFIDENCE = float(os.getenv("LANGUAGE_MIN_CONFIDENCE", "0.45"))
+
+
+# --- Who the agent is ---------------------------------------------------------
+
+# Used when the agent introduces itself on a call we placed. The caller did not
+# ask to be rung, so saying who this is comes first.
+BUSINESS_NAME = os.getenv("BUSINESS_NAME", "Acme Solutions").strip()
+
+# Look the caller up in the CRM before speaking, so a known lead is greeted by
+# name and not asked things already on file. False keeps every call anonymous.
+CALLER_CONTEXT = _flag("CALLER_CONTEXT", default=True)
+
+# Greetings. {name} is the caller's first name, {business} this company.
+# GREETING_TEXT above stays the one for a stranger calling in.
+GREETING_RETURNING = os.getenv(
+    "GREETING_RETURNING",
+    "Hello {name}, thanks for calling back. How can I help you today?",
+).strip()
+GREETING_CUSTOMER = os.getenv(
+    "GREETING_CUSTOMER",
+    "Hello {name}, thanks for calling {business}. How can I help?",
+).strip()
+GREETING_OUTBOUND = os.getenv(
+    "GREETING_OUTBOUND",
+    "Hello {name}, this is {business} calling about your enquiry. "
+    "Is now a good time to talk?",
+).strip()
+GREETING_OUTBOUND_UNKNOWN = os.getenv(
+    "GREETING_OUTBOUND_UNKNOWN",
+    "Hello, this is {business} calling about your enquiry. "
+    "Is now a good time to talk?",
+).strip()
